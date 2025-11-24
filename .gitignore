@@ -149,6 +149,9 @@ phoenix*
 debug/
 *projs/
 
+log
+log/
+
 core.*
 
 # mmcv package

@@ -38,7 +38,7 @@ bev_w_ = 200
 _feed_dim_ = _ffn_dim_
 _dim_half_ = _pos_dim_
 canvas_size = (bev_h_, bev_w_)
-queue_length = 3  # each sequence contains `queue_length` frames.
+queue_length = 5  # each sequence contains `queue_length` frames.
 
 ### traj prediction args ###
 predict_steps = 12
@@ -104,9 +104,9 @@ model = dict(
         relu_before_extra_convs=True,
     ),
     freeze_img_backbone=True,
-    freeze_img_neck=True,
-    freeze_bn=True,
-    freeze_bev_encoder=True,
+    freeze_img_neck=False,
+    freeze_bn=False,
+    freeze_bev_encoder=False,
     score_thresh=0.4,
     filter_score_thresh=0.35,
     qim_args=dict(

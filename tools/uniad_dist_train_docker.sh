@@ -37,6 +37,17 @@ if [ ! -d ${WORK_DIR}logs ]; then
     mkdir -p ${WORK_DIR}logs
 fi
 
+export TORCH_CUDA_ARCH_LIST=9.0
+export LD_LIBRARY_PATH=/root/anaconda3/envs/uniad_new/lib/python3.8/site-packages/torch/lib:$LD_LIBRARY_PATH
+export PATH=/root/cuda-12.2/bin/:$PATH
+export LD_LIBRARY_PATH=/root/cuda-12.2/lib64/:$LD_LIBRARY_PATH
+export CUDA_HOME=/root/cuda-12.2
+source /root/anaconda3/etc/profile.d/conda.sh
+conda activate uniad_new
+export NCCL_IB_GID_INDEX="3"
+sed -i '1s|#!/ssd2/wenshengzhao/anaconda3/envs/uniad_new/bin/python|#!/root/anaconda3/envs/uniad_new/bin/python|' /root/anaconda3/envs/uniad_new/bin/torchrun
+
+
 PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
 torchrun \
     --nproc_per_node=${GPUS_PER_NODE} \

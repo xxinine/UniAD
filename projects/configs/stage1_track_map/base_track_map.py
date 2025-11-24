@@ -588,3 +588,6 @@ load_from = "ckpts/bevformer_r101_dcn_24ep.pth"
 
 find_unused_parameters = True
 logger_name = 'mmdet'
+
+# Enable cudnn benchmark for potential training speedup
+cudnn_benchmark = True
