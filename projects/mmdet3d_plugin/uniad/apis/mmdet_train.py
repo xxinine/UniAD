@@ -9,6 +9,7 @@ from mmcv.runner import (HOOKS, DistSamplerSeedHook, EpochBasedRunner,
                          Fp16OptimizerHook, OptimizerHook, build_optimizer,
                          build_runner, get_dist_info)
 from mmcv.utils import build_from_cfg
+from projects.mmdet3d_plugin.models.hooks import Bf16OptimizerHook
 
 from mmdet.core import EvalHook
 
@@ -123,9 +124,16 @@ def custom_train_detector(model,
     # an ugly workaround to make .log and .log.json filenames the same
     runner.timestamp = timestamp
 
-    # fp16 setting
+    # fp16 or bf16 setting
     fp16_cfg = cfg.get('fp16', None)
-    if fp16_cfg is not None:
+    bf16_cfg = cfg.get('bf16', None)
+    
+    if bf16_cfg is not None:
+        # BF16 mixed precision training
+        optimizer_config = Bf16OptimizerHook(
+            **cfg.optimizer_config, distributed=distributed)
+    elif fp16_cfg is not None:
+        # FP16 mixed precision training
         optimizer_config = Fp16OptimizerHook(
             **cfg.optimizer_config, **fp16_cfg, distributed=distributed)
     elif distributed and 'type' not in cfg.optimizer_config:

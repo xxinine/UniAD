@@ -483,7 +483,7 @@ class PansegformerHead(SegDETRHead):
                                        img_h]).unsqueeze(0)
         pos_gt_bboxes_normalized = sampling_result.pos_gt_bboxes / factor
         pos_gt_bboxes_targets = bbox_xyxy_to_cxcywh(pos_gt_bboxes_normalized)
-        bbox_targets[pos_inds] = pos_gt_bboxes_targets
+        bbox_targets[pos_inds] = pos_gt_bboxes_targets.to(bbox_targets.dtype)
 
         return (pos_ind_mask, neg_ind_mask, labels, label_weights,
                 bbox_targets, bbox_weights, pos_inds, neg_inds)
@@ -584,14 +584,14 @@ class PansegformerHead(SegDETRHead):
                                        img_h]).unsqueeze(0)
         pos_gt_bboxes_normalized = sampling_result.pos_gt_bboxes / factor
         pos_gt_bboxes_targets = bbox_xyxy_to_cxcywh(pos_gt_bboxes_normalized)
-        bbox_targets[pos_inds] = pos_gt_bboxes_targets
+        bbox_targets[pos_inds] = pos_gt_bboxes_targets.to(bbox_targets.dtype)
 
         mask_weights = masks_preds_things.new_zeros(num_bboxes)
         mask_weights[pos_inds] = 1.0
         pos_gt_masks = sampling_result.pos_gt_masks
         _, w, h = pos_gt_masks.shape
         mask_target = masks_preds_things.new_zeros([num_bboxes, w, h])
-        mask_target[pos_inds] = pos_gt_masks
+        mask_target[pos_inds] = pos_gt_masks.to(mask_target.dtype)
 
         return (labels, label_weights, bbox_targets, bbox_weights, mask_target,
                 mask_weights, pos_inds, neg_inds)
