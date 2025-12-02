@@ -171,12 +171,22 @@ class UniAD(UniADTrack):
         bev_embed = outs_track["bev_embed"]
         bev_pos  = outs_track["bev_pos"]
 
-        img_metas = [each[len_queue-1] for each in img_metas]
+        # img_metas is flattened: List[Dict] with len = B * L
+        # Extract last frame metas for each sample (for downstream heads)
+        batch_size = img.size(0)
+        # Get last temporal frame for each batch sample
+        img_metas_last = [img_metas[b * len_queue + (len_queue - 1)] for b in range(batch_size)]
 
         outs_seg = dict()
-        if self.with_seg_head:          
-            losses_seg, outs_seg = self.seg_head.forward_train(bev_embed, img_metas,
-                                                          gt_lane_labels, gt_lane_bboxes, gt_lane_masks)
+        if self.with_seg_head:
+            # Move GT data to correct device
+            device = bev_embed.device
+            gt_lane_labels_cuda = [x.to(device) if isinstance(x, torch.Tensor) else x for x in gt_lane_labels]
+            gt_lane_bboxes_cuda = [x.to(device) if isinstance(x, torch.Tensor) else x for x in gt_lane_bboxes]
+            gt_lane_masks_cuda = [x.to(device) if isinstance(x, torch.Tensor) else x for x in gt_lane_masks]
+            
+            losses_seg, outs_seg = self.seg_head.forward_train(bev_embed, img_metas_last,
+                                                          gt_lane_labels_cuda, gt_lane_bboxes_cuda, gt_lane_masks_cuda)
             
             losses_seg = self.loss_weighted_and_prefixed(losses_seg, prefix='map')
             losses.update(losses_seg)

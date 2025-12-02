@@ -322,7 +322,9 @@ class PansegformerHead(SegDETRHead):
         Returns:
             dict[str, Tensor]: A dictionary of loss components.
         """
-        img_metas[0]['img_shape'] = (self.canvas_size[0], self.canvas_size[1], 3)
+        # Set img_shape for all samples in batch (for BEV canvas size)
+        for img_meta in img_metas:
+            img_meta['img_shape'] = (self.canvas_size[0], self.canvas_size[1], 3)
 
         assert gt_bboxes_ignore is None, \
             f'{self.__class__.__name__} only supports ' \
@@ -770,7 +772,9 @@ class PansegformerHead(SegDETRHead):
                 mask_preds_inter_things[j].append(tmp_i_j)
 
                 # mask_preds_inter_things[j].append(mask_inter_things[j].reshape(-1, *hw_lvl[0]))
-                query_things = query_inter_things[j]
+                # Get queries for sample i, only the valid ones (up to len(pos_ind))
+                num_pos_i = len(pos_ind)
+                query_things = query_inter_things[j][i:i+1, :num_pos_i]  # [1, num_pos_i, dim]
                 t1, t2, t3 = query_things.shape
                 tmp = self.reg_branches2[j](query_things.reshape(t1 * t2, t3)).reshape(t1, t2, 4)
                 if len(pos_ind) == 0:
@@ -782,7 +786,7 @@ class PansegformerHead(SegDETRHead):
                     assert reference_i.shape[-1] == 2
                     tmp[..., :2] += reference_i
 
-                outputs_coord = tmp.sigmoid()
+                outputs_coord = tmp.sigmoid().squeeze(0)  # [num_pos_i, 4]
 
                 new_bbox_preds[j][i][:len(pos_inds_mask_list[i])] = outputs_coord
                 cls_thing_preds[j].append(self.cls_thing_branches[j](
@@ -795,7 +799,8 @@ class PansegformerHead(SegDETRHead):
                 tmp_i_j = mask_inter_stuff[j][i].reshape(-1, *hw_lvl[0])
                 mask_preds_inter_stuff[j].append(tmp_i_j)
 
-                query_stuff = query_inter_stuff[j]
+                # Index by current batch sample i to get [num_stuff, dim]
+                query_stuff = query_inter_stuff[j][i:i+1]
                 s1, s2, s3 = query_stuff.shape
                 cls_stuff_preds[j].append(self.cls_stuff_branches[j](
                     query_stuff.reshape(s1 * s2, s3)))
@@ -934,7 +939,12 @@ class PansegformerHead(SegDETRHead):
                                              mask_weight_things,
                                              avg_factor=num_total_pos_thing)
             loss_mask_things_list.append(loss_mask_j)
-            bbox_preds_this_level = new_bbox_preds[j].reshape(-1, 4)
+            # Only take valid predictions for each sample (matching pos_inds_mask_list)
+            bbox_preds_this_level_list = [
+                new_bbox_preds[j][i, :len(pos_inds_mask_list[i])] 
+                for i in range(num_imgs)
+            ]
+            bbox_preds_this_level = torch.cat(bbox_preds_this_level_list, 0) if bbox_preds_this_level_list else new_bbox_preds[j].reshape(-1, 4)[:0]
             bboxes_this_level = bbox_cxcywh_to_xyxy(
                 bbox_preds_this_level) * factors
             # We let this loss be 0. We didn't predict bbox in our mask decoder. Predicting bbox in the mask decoder is basically useless

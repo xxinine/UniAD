@@ -15,6 +15,7 @@ from mmdet.datasets.samplers import GroupSampler
 from projects.mmdet3d_plugin.datasets.samplers.group_sampler import DistributedGroupSampler
 from projects.mmdet3d_plugin.datasets.samplers.distributed_sampler import DistributedSampler
 from projects.mmdet3d_plugin.datasets.samplers.sampler import build_sampler
+from projects.mmdet3d_plugin.datasets.collate import temporal_batch_collate
 
 def build_dataloader(dataset,
                      samples_per_gpu,
@@ -85,7 +86,7 @@ def build_dataloader(dataset,
         batch_size=batch_size,
         sampler=sampler,
         num_workers=num_workers,
-        collate_fn=partial(collate, samples_per_gpu=samples_per_gpu),
+        collate_fn=partial(temporal_batch_collate, samples_per_gpu=samples_per_gpu),
         pin_memory=False,
         worker_init_fn=init_fn,
         **kwargs)

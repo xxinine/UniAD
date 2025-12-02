@@ -491,93 +491,210 @@ class UniADTrack(MVXTwoStageDetector):
 
     @auto_fp16(apply_to=("img", "points"))
     def forward_track_train(self,
-                            img,
-                            gt_bboxes_3d,
-                            gt_labels_3d,
+                            img,  # [B, L, N, C, H, W]
+                            gt_bboxes_3d,  # List[List[Boxes]], len=B, each len=L
+                            gt_labels_3d,  # List[List[Tensor]], len=B
                             gt_past_traj,
                             gt_past_traj_mask,
                             gt_inds,
                             gt_sdc_bbox,
                             gt_sdc_label,
-                            l2g_t,
-                            l2g_r_mat,
-                            img_metas,
-                            timestamp):
-        """Forward funciton
-        Args:
-        Returns:
+                            l2g_t,  # Flattened List[Tensor], len=B*L
+                            l2g_r_mat,  # Flattened List[Tensor], len=B*L
+                            img_metas,  # Flattened List[Dict], len=B*L (with batch_idx, temporal_idx)
+                            timestamp):  # Flattened List[Tensor], len=B*L
         """
-        track_instances = self._generate_empty_tracks()
+        Forward function with batch support.
+        Processes each batch sample independently due to complex tracking state.
+        Feature extraction happens per-frame via get_bevs -> extract_img_feat.
+        
+        Note: GT data is flattened from collate. Use flat_idx = b * num_frame + i to access.
+        
+        Args:
+            img: [batch_size, queue_length, num_cams, C, H, W]
+            gt_bboxes_3d: Flattened List[Boxes], len = B * L
+            img_metas: Flattened List[Dict], len = B * L
+        
+        Returns:
+            losses: Dict of losses (averaged across batch)
+            out: Dict of outputs (merged from batch)
+        """
+        
+        batch_size = img.size(0)
         num_frame = img.size(1)
-        # init gt instances!
-        gt_instances_list = []
-
-        for i in range(num_frame):
-            gt_instances = Instances((1, 1))
-            boxes = gt_bboxes_3d[0][i].tensor.to(img.device)
-            # normalize gt bboxes here!
-            boxes = normalize_bbox(boxes, self.pc_range)
-            sd_boxes = gt_sdc_bbox[0][i].tensor.to(img.device)
-            sd_boxes = normalize_bbox(sd_boxes, self.pc_range)
-            gt_instances.boxes = boxes
-            gt_instances.labels = gt_labels_3d[0][i]
-            gt_instances.obj_ids = gt_inds[0][i]
-            gt_instances.past_traj = gt_past_traj[0][i].float()
-            gt_instances.past_traj_mask = gt_past_traj_mask[0][i].float()
-            gt_instances.sdc_boxes = torch.cat([sd_boxes for _ in range(boxes.shape[0])], dim=0)  # boxes.shape[0] sometimes 0
-            gt_instances.sdc_labels = torch.cat([gt_sdc_label[0][i] for _ in range(gt_labels_3d[0][i].shape[0])], dim=0)
-            gt_instances_list.append(gt_instances)
-
-        self.criterion.initialize_for_single_clip(gt_instances_list)
-
-        out = dict()
-
-        for i in range(num_frame):
-            prev_img = img[:, :i, ...] if i != 0 else img[:, :1, ...]
-            prev_img_metas = copy.deepcopy(img_metas)
-            # TODO: Generate prev_bev in an RNN way.
-
-            img_single = torch.stack([img_[i] for img_ in img], dim=0)
-            img_metas_single = [copy.deepcopy(img_metas[0][i])]
-            if i == num_frame - 1:
-                l2g_r2 = None
-                l2g_t2 = None
-                time_delta = None
-            else:
-                l2g_r2 = l2g_r_mat[0][i + 1]
-                l2g_t2 = l2g_t[0][i + 1]
-                time_delta = timestamp[0][i + 1] - timestamp[0][i]
-            all_query_embeddings = []
-            all_matched_idxes = []
-            all_instances_pred_logits = []
-            all_instances_pred_boxes = []
-            frame_res = self._forward_single_frame_train(
-                img_single,
-                img_metas_single,
-                track_instances,
-                prev_img,
-                prev_img_metas,
-                l2g_r_mat[0][i],
-                l2g_t[0][i],
-                l2g_r2,
-                l2g_t2,
-                time_delta,
-                all_query_embeddings,
-                all_matched_idxes,
-                all_instances_pred_logits,
-                all_instances_pred_boxes,
-            )
-            # all_query_embeddings: len=dec nums, N*256
-            # all_matched_idxes: len=dec nums, N*2
-            track_instances = frame_res["track_instances"]
         
-        get_keys = ["bev_embed", "bev_pos",
-                    "track_query_embeddings", "track_query_matched_idxes", "track_bbox_results",
-                    "sdc_boxes_3d", "sdc_scores_3d", "sdc_track_scores", "sdc_track_bbox_results", "sdc_embedding"]
-        out.update({k: frame_res[k] for k in get_keys})
+        # Helper function to get flattened index
+        def flat_idx(b, i):
+            return b * num_frame + i
         
-        losses = self.criterion.losses_dict
-        return losses, out
+        # Reconstruct img_metas per sample for later use
+        # img_metas is flattened list, need to group by batch
+        img_metas_per_sample = []
+        for b in range(batch_size):
+            sample_metas = {}
+            for i in range(num_frame):
+                sample_metas[i] = img_metas[flat_idx(b, i)]
+            img_metas_per_sample.append(sample_metas)
+        
+        # ============ Loop Part: Tracking Processing ============
+        # Process each batch sample independently
+        # Feature extraction happens per-frame via _forward_single_frame_train -> get_bevs
+        accumulated_losses = {}  # Accumulate losses across batch samples
+        batch_outs = []
+        
+        for b in range(batch_size):
+            # Initialize tracking instances for this sample
+            track_instances = self._generate_empty_tracks()
+            gt_instances_list = []
+            
+            # Prepare GT instances for all frames of this sample
+            for i in range(num_frame):
+                gt_instances = Instances((1, 1))
+                fidx = flat_idx(b, i)
+                
+                boxes = gt_bboxes_3d[fidx].tensor.to(img.device)
+                boxes = normalize_bbox(boxes, self.pc_range)
+                sd_boxes = gt_sdc_bbox[fidx].tensor.to(img.device)
+                sd_boxes = normalize_bbox(sd_boxes, self.pc_range)
+                
+                gt_instances.boxes = boxes
+                gt_instances.labels = gt_labels_3d[fidx].to(img.device)
+                gt_instances.obj_ids = gt_inds[fidx].to(img.device)
+                gt_instances.past_traj = gt_past_traj[fidx].float().to(img.device)
+                gt_instances.past_traj_mask = gt_past_traj_mask[fidx].float().to(img.device)
+                
+                # Handle empty boxes case
+                if boxes.shape[0] > 0:
+                    gt_instances.sdc_boxes = torch.cat([sd_boxes for _ in range(boxes.shape[0])], dim=0)
+                    gt_instances.sdc_labels = torch.cat([gt_sdc_label[fidx].to(img.device) for _ in range(gt_labels_3d[fidx].shape[0])], dim=0)
+                else:
+                    gt_instances.sdc_boxes = sd_boxes
+                    gt_instances.sdc_labels = gt_sdc_label[fidx].to(img.device)
+                
+                gt_instances_list.append(gt_instances)
+            
+            # Initialize criterion for this clip
+            self.criterion.initialize_for_single_clip(gt_instances_list)
+            
+            # Process each frame of this sample
+            for i in range(num_frame):
+                fidx = flat_idx(b, i)
+                
+                # Prepare previous frames for temporal context
+                if i > 0:
+                    prev_img = img[b:b+1, :i, ...]  # [1, i, N, C, H, W]
+                else:
+                    prev_img = img[b:b+1, :1, ...]  # [1, 1, N, C, H, W]
+                
+                prev_img_metas = [img_metas_per_sample[b]]
+                
+                # Current frame
+                img_single = img[b:b+1, i, ...]  # [1, N, C, H, W]
+                img_metas_single = [copy.deepcopy(img_metas[fidx])]
+                
+                # Coordinate transforms (using flattened index)
+                # Ensure tensors are on the correct device
+                l2g_r1_cur = l2g_r_mat[fidx].to(img.device) if isinstance(l2g_r_mat[fidx], torch.Tensor) else torch.tensor(l2g_r_mat[fidx], device=img.device)
+                l2g_t1_cur = l2g_t[fidx].to(img.device) if isinstance(l2g_t[fidx], torch.Tensor) else torch.tensor(l2g_t[fidx], device=img.device)
+                
+                if i == num_frame - 1:
+                    l2g_r2 = None
+                    l2g_t2 = None
+                    time_delta = None
+                else:
+                    next_fidx = flat_idx(b, i + 1)
+                    l2g_r2 = l2g_r_mat[next_fidx].to(img.device) if isinstance(l2g_r_mat[next_fidx], torch.Tensor) else torch.tensor(l2g_r_mat[next_fidx], device=img.device)
+                    l2g_t2 = l2g_t[next_fidx].to(img.device) if isinstance(l2g_t[next_fidx], torch.Tensor) else torch.tensor(l2g_t[next_fidx], device=img.device)
+                    ts_next = timestamp[next_fidx].to(img.device) if isinstance(timestamp[next_fidx], torch.Tensor) else torch.tensor(timestamp[next_fidx], device=img.device)
+                    ts_cur = timestamp[fidx].to(img.device) if isinstance(timestamp[fidx], torch.Tensor) else torch.tensor(timestamp[fidx], device=img.device)
+                    time_delta = ts_next - ts_cur
+                
+                # Storage for decoder outputs
+                all_query_embeddings = []
+                all_matched_idxes = []
+                all_instances_pred_logits = []
+                all_instances_pred_boxes = []
+                
+                # Forward single frame (original logic, no change needed)
+                frame_res = self._forward_single_frame_train(
+                    img_single,
+                    img_metas_single,
+                    track_instances,
+                    prev_img,
+                    prev_img_metas,
+                    l2g_r1_cur,
+                    l2g_t1_cur,
+                    l2g_r2,
+                    l2g_t2,
+                    time_delta,
+                    all_query_embeddings,
+                    all_matched_idxes,
+                    all_instances_pred_logits,
+                    all_instances_pred_boxes,
+                )
+                
+                # Update tracking instances
+                track_instances = frame_res["track_instances"]
+            
+            # Collect outputs for this sample
+            get_keys = ["bev_embed", "bev_pos",
+                        "track_query_embeddings", "track_query_matched_idxes", "track_bbox_results",
+                        "sdc_boxes_3d", "sdc_scores_3d", "sdc_track_scores", "sdc_track_bbox_results", "sdc_embedding"]
+            out_b = {k: frame_res[k] for k in get_keys}
+            
+            # Accumulate losses for this sample (keep gradients by adding tensors directly)
+            for k, v in self.criterion.losses_dict.items():
+                if k not in accumulated_losses:
+                    accumulated_losses[k] = v
+                else:
+                    accumulated_losses[k] = accumulated_losses[k] + v
+            
+            batch_outs.append(out_b)
+        
+        # ============ Merge Batch Results ============
+        # Average losses across batch (divide by batch_size)
+        merged_losses = {k: v / batch_size for k, v in accumulated_losses.items()}
+        
+        # Merge outputs for subsequent modules
+        merged_outs = self._merge_batch_track_outputs(batch_outs)
+        
+        return merged_losses, merged_outs
+    
+    def _merge_batch_track_outputs(self, batch_outs):
+        """
+        Merge outputs from multiple batch samples
+        
+        Args:
+            batch_outs: List[Dict], len=batch_size
+        
+        Returns:
+            merged: Dict with batched/concatenated outputs
+        """
+        batch_size = len(batch_outs)
+        
+        merged = {}
+        
+        # Merge BEV features: [H*W, B, C]
+        bev_embeds = [out['bev_embed'] for out in batch_outs]
+        merged['bev_embed'] = torch.cat(bev_embeds, dim=1)
+        
+        # BEV pos: [B, C, H, W]
+        if 'bev_pos' in batch_outs[0]:
+            bev_pos_list = [out['bev_pos'] for out in batch_outs]
+            merged['bev_pos'] = torch.cat(bev_pos_list, dim=0)
+        
+        # For tracking queries and embeddings, keep as list (variable length per sample)
+        for key in ['track_query_embeddings', 'sdc_embedding']:
+            if key in batch_outs[0]:
+                merged[key] = [out[key] for out in batch_outs]
+        
+        # For detection results, keep as list
+        for key in ['track_query_matched_idxes', 'track_bbox_results',
+                    'sdc_boxes_3d', 'sdc_scores_3d', 'sdc_track_scores', 'sdc_track_bbox_results']:
+            if key in batch_outs[0]:
+                merged[key] = [out[key] for out in batch_outs]
+        
+        return merged
 
     def upsample_bev_if_tiny(self, outs_track):
         if outs_track["bev_embed"].size(0) == 100 * 100:
