@@ -151,28 +151,66 @@ class UniADTrack(MVXTwoStageDetector):
         self.freeze_bev_encoder = freeze_bev_encoder
 
     def extract_img_feat(self, img, len_queue=None):
-        """Extract features of images."""
+        """Extract features of images with proper batch handling.
+        
+        Args:
+            img: Tensor
+                - If len_queue is None: [B, N, C, H, W]
+                - If len_queue is not None: [B, L, N, C, H, W]
+                B: batch_size
+                L: len_queue (temporal frames)
+                N: num_cameras
+        
+        Returns:
+            img_feats_reshaped: List[Tensor]
+                - If len_queue is None: [B, N, c, h, w]
+                - If len_queue is not None: [B, L, N, c, h, w]
+        """
         if img is None:
             return None
-        assert img.dim() == 5
-        B, N, C, H, W = img.size()
-        img = img.reshape(B * N, C, H, W)
+
+        # print("DEBUG " + "-" * 20)
+        # print(f"DEBUG extract_img_feat img.size: {img.size()}")
+
+        # Handle batch + temporal dimensions
+        if len_queue is not None:
+            # Input: [B, L, N, C, H, W]
+            assert img.dim() == 6, f"Expected 6D tensor when len_queue is provided, got {img.dim()}D"
+            B, L, N, C, H, W = img.size()
+            batch_size = B
+            # Reshape for backbone: [B*L*N, C, H, W]
+            img = img.reshape(B * L * N, C, H, W)
+        else:
+            # Input: [B, N, C, H, W]
+            assert img.dim() == 5, f"Expected 5D tensor, got {img.dim()}D"
+            B, N, C, H, W = img.size()
+            batch_size = B
+            L = 1
+            # Reshape for backbone: [B*N, C, H, W]
+            img = img.reshape(B * N, C, H, W)
+        
         if self.use_grid_mask:
             img = self.grid_mask(img)
+        
+        # CNN feature extraction (true batch parallelism)
         img_feats = self.img_backbone(img)
         if isinstance(img_feats, dict):
             img_feats = list(img_feats.values())
         if self.with_img_neck:
             img_feats = self.img_neck(img_feats)
 
+        # Reshape back to batch dimensions
         img_feats_reshaped = []
         for img_feat in img_feats:
-            _, c, h, w = img_feat.size()
+            BLN, c, h, w = img_feat.size()
             if len_queue is not None:
-                img_feat_reshaped = img_feat.view(B//len_queue, len_queue, N, c, h, w)
+                # [B*L*N, c, h, w] -> [B, L, N, c, h, w]
+                img_feat_reshaped = img_feat.view(batch_size, L, N, c, h, w)
             else:
-                img_feat_reshaped = img_feat.view(B, N, c, h, w)
+                # [B*N, c, h, w] -> [B, N, c, h, w]
+                img_feat_reshaped = img_feat.view(batch_size, N, c, h, w)
             img_feats_reshaped.append(img_feat_reshaped)
+        
         return img_feats_reshaped
 
     def _generate_empty_tracks(self):
@@ -313,18 +351,31 @@ class UniADTrack(MVXTwoStageDetector):
         track_instances.save_period = copy.deepcopy(tgt_instances.save_period)
         return track_instances.to(device)
 
-    def get_history_bev(self, imgs_queue, img_metas_list):
+    def get_history_bev(self, imgs_queue, img_metas_list, img_feats_list=None):
         """
         Get history BEV features iteratively. To save GPU memory, gradients are not calculated.
+        
+        Args:
+            imgs_queue: [B, T, N, C, H, W] - history frames (can be None if img_feats_list provided)
+            img_metas_list: List[Dict] where each dict has temporal indices as keys
+            img_feats_list: List[Tensor[B, T, N, c, h, w]] - pre-extracted features (optional)
         """
         self.eval()
         with torch.no_grad():
             prev_bev = None
-            bs, len_queue, num_cams, C, H, W = imgs_queue.shape
-            imgs_queue = imgs_queue.reshape(bs * len_queue, num_cams, C, H, W)
-            img_feats_list = self.extract_img_feat(img=imgs_queue, len_queue=len_queue)
+            
+            # Use pre-extracted features if provided, otherwise extract
+            if img_feats_list is None:
+                bs, len_queue, num_cams, C, H, W = imgs_queue.shape
+                img_feats_list = self.extract_img_feat(img=imgs_queue, len_queue=len_queue)
+            else:
+                # Get len_queue from features
+                len_queue = img_feats_list[0].shape[1]
+            
+            # img_feats_list: List[Tensor[B, T, N, c, h, w]]
             for i in range(len_queue):
                 img_metas = [each[i] for each in img_metas_list]
+                # Extract features for frame i: [B, N, c, h, w]
                 img_feats = [each_scale[:, i] for each_scale in img_feats_list]
                 prev_bev, _ = self.pts_bbox_head.get_bev_features(
                     mlvl_feats=img_feats, 
@@ -334,12 +385,33 @@ class UniADTrack(MVXTwoStageDetector):
         return prev_bev
 
     # Generate bev using bev_encoder in BEVFormer
-    def get_bevs(self, imgs, img_metas, prev_img=None, prev_img_metas=None, prev_bev=None):
-        if prev_img is not None and prev_img_metas is not None:
+    def get_bevs(self, imgs, img_metas, prev_img=None, prev_img_metas=None, prev_bev=None,
+                 img_feats=None, prev_img_feats=None):
+        """
+        Generate BEV features with batch support
+        
+        Args:
+            imgs: [B, N, C, H, W] or [B, L, N, C, H, W] - current frame(s) (can be None if img_feats provided)
+            img_metas: List[Dict], len=B
+            prev_img: [B, T, N, C, H, W] or None - history frames (can be None if prev_img_feats provided)
+            prev_img_metas: List[List[Dict]] or None
+            prev_bev: Tensor or None
+            img_feats: List[Tensor] - pre-extracted features for current frame (optional)
+            prev_img_feats: List[Tensor[B, T, N, c, h, w]] - pre-extracted features for history (optional)
+        
+        Returns:
+            bev_embed: [H*W, B, C]
+            bev_pos: [B, C, H, W]
+        """
+        if prev_img_metas is not None and (prev_img is not None or prev_img_feats is not None):
             assert prev_bev is None
-            prev_bev = self.get_history_bev(prev_img, prev_img_metas)
+            prev_bev = self.get_history_bev(prev_img, prev_img_metas, img_feats_list=prev_img_feats)
 
-        img_feats = self.extract_img_feat(img=imgs)
+        # Use pre-extracted features if provided, otherwise extract
+        if img_feats is None:
+            img_feats = self.extract_img_feat(img=imgs)
+        
+        # BEV encoder also supports batch naturally
         if self.freeze_bev_encoder:
             with torch.no_grad():
                 bev_embed, bev_pos = self.pts_bbox_head.get_bev_features(
@@ -348,10 +420,13 @@ class UniADTrack(MVXTwoStageDetector):
             bev_embed, bev_pos = self.pts_bbox_head.get_bev_features(
                     mlvl_feats=img_feats, img_metas=img_metas, prev_bev=prev_bev)
         
+        # Ensure correct BEV shape: [H*W, B, C]
         if bev_embed.shape[1] == self.bev_h * self.bev_w:
-            bev_embed = bev_embed.permute(1, 0, 2)
+            bev_embed = bev_embed.permute(1, 0, 2)  # [B, H*W, C] -> [H*W, B, C]
         
-        assert bev_embed.shape[0] == self.bev_h * self.bev_w
+        assert bev_embed.shape[0] == self.bev_h * self.bev_w, \
+            f"BEV spatial dim {bev_embed.shape[0]} != {self.bev_h * self.bev_w}"
+        
         return bev_embed, bev_pos
 
     @auto_fp16(apply_to=("img", "prev_bev"))
@@ -371,12 +446,16 @@ class UniADTrack(MVXTwoStageDetector):
         all_matched_indices=None,
         all_instances_pred_logits=None,
         all_instances_pred_boxes=None,
+        img_feats=None,
+        prev_img_feats=None,
     ):
         """
         Perform forward only on one frame. Called in  forward_train
         Warnning: Only Support BS=1
         Args:
-            img: shape [B, num_cam, 3, H, W]
+            img: shape [B, num_cam, 3, H, W] (can be None if img_feats provided)
+            img_feats: List[Tensor] - pre-extracted features for current frame (optional)
+            prev_img_feats: List[Tensor] - pre-extracted features for history frames (optional)
             if l2g_r2 is None or l2g_t2 is None:
                 it means this frame is the end of the training clip,
                 so no need to call velocity update
@@ -385,6 +464,7 @@ class UniADTrack(MVXTwoStageDetector):
         bev_embed, bev_pos = self.get_bevs(
             img, img_metas,
             prev_img=prev_img, prev_img_metas=prev_img_metas,
+            img_feats=img_feats, prev_img_feats=prev_img_feats,
         )
         det_output = self.pts_bbox_head.get_detections(
             bev_embed,
@@ -504,9 +584,9 @@ class UniADTrack(MVXTwoStageDetector):
                             img_metas,  # Flattened List[Dict], len=B*L (with batch_idx, temporal_idx)
                             timestamp):  # Flattened List[Tensor], len=B*L
         """
-        Forward function with batch support.
-        Processes each batch sample independently due to complex tracking state.
-        Feature extraction happens per-frame via get_bevs -> extract_img_feat.
+        Forward function with hybrid batch strategy:
+        1. Feature extraction uses true batch (parallel processing)
+        2. Tracking state management uses loop processing (per-sample independence)
         
         Note: GT data is flattened from collate. Use flat_idx = b * num_frame + i to access.
         
@@ -536,9 +616,14 @@ class UniADTrack(MVXTwoStageDetector):
                 sample_metas[i] = img_metas[flat_idx(b, i)]
             img_metas_per_sample.append(sample_metas)
         
+        # ============ True Batch Part: Feature Extraction ============
+        # Extract features for all batches and all frames at once (fully parallel)
+        # This is the key optimization - CNN/Transformer can process batch efficiently
+        img_feats_all = self.extract_img_feat(img=img, len_queue=num_frame)
+        # img_feats_all: List[Tensor[B, L, N, c, h, w]]
+        
         # ============ Loop Part: Tracking Processing ============
-        # Process each batch sample independently
-        # Feature extraction happens per-frame via _forward_single_frame_train -> get_bevs
+        # Process each batch sample independently due to complex tracking state
         accumulated_losses = {}  # Accumulate losses across batch samples
         batch_outs = []
         
@@ -580,11 +665,18 @@ class UniADTrack(MVXTwoStageDetector):
             for i in range(num_frame):
                 fidx = flat_idx(b, i)
                 
-                # Prepare previous frames for temporal context
+                # Extract features for this sample and frame (from pre-computed features)
+                img_feats_single = [feat[b:b+1, i] for feat in img_feats_all]
+                # Shape: [1, N, c, h, w]
+                
+                # Prepare previous frames features for temporal context
                 if i > 0:
-                    prev_img = img[b:b+1, :i, ...]  # [1, i, N, C, H, W]
+                    prev_img_feats = [feat[b:b+1, :i] for feat in img_feats_all]
+                    # Shape: [1, i, N, c, h, w]
                 else:
-                    prev_img = img[b:b+1, :1, ...]  # [1, 1, N, C, H, W]
+                    # First frame: use frame 0 as its own history (warm-up)
+                    prev_img_feats = [feat[b:b+1, :1] for feat in img_feats_all]
+                    # Shape: [1, 1, N, c, h, w]
                 
                 prev_img_metas = [img_metas_per_sample[b]]
                 
@@ -615,12 +707,12 @@ class UniADTrack(MVXTwoStageDetector):
                 all_instances_pred_logits = []
                 all_instances_pred_boxes = []
                 
-                # Forward single frame (original logic, no change needed)
+                # Forward single frame with pre-extracted features
                 frame_res = self._forward_single_frame_train(
                     img_single,
                     img_metas_single,
                     track_instances,
-                    prev_img,
+                    None,  # prev_img not needed when using pre-extracted features
                     prev_img_metas,
                     l2g_r1_cur,
                     l2g_t1_cur,
@@ -631,6 +723,8 @@ class UniADTrack(MVXTwoStageDetector):
                     all_matched_idxes,
                     all_instances_pred_logits,
                     all_instances_pred_boxes,
+                    img_feats=img_feats_single,
+                    prev_img_feats=prev_img_feats,
                 )
                 
                 # Update tracking instances
