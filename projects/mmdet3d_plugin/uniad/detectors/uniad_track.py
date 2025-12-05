@@ -384,6 +384,71 @@ class UniADTrack(MVXTwoStageDetector):
         self.train()
         return prev_bev
 
+    @auto_fp16(apply_to=("img_feats_all",))
+    def precompute_all_bevs(self, img_feats_all, img_metas_per_sample, batch_size, num_frames):
+        """
+        Pre-compute all BEV features for all frames.
+        
+        This removes BEV computation from the tracking loop, enabling:
+        1. Better GPU utilization (larger effective batch)
+        2. Reduced redundant computation (history BEV recomputation)
+        
+        Args:
+            img_feats_all: List[Tensor[B, L, N, c, h, w]] - pre-extracted image features
+            img_metas_per_sample: List[Dict] where Dict[frame_idx] = img_meta
+            batch_size: int
+            num_frames: int
+        
+        Returns:
+            all_bev_embeds: Tensor[B, L, H*W, C] - all BEV features
+            bev_pos: Tensor[B, C, H, W] - BEV positional encoding (same for all frames)
+        """
+        all_bev_embeds = []
+        bev_pos = None
+        
+        for b in range(batch_size):
+            sample_bevs = []
+            prev_bev = None
+            
+            for i in range(num_frames):
+                # Get image features for this sample and frame
+                img_feats = [feat[b:b+1, i] for feat in img_feats_all]
+                # Shape: [1, N, c, h, w]
+                
+                img_metas = [img_metas_per_sample[b][i]]
+                
+                # Compute BEV with temporal fusion (using prev_bev)
+                if self.freeze_bev_encoder:
+                    with torch.no_grad():
+                        bev_embed, bev_pos = self.pts_bbox_head.get_bev_features(
+                            mlvl_feats=img_feats,
+                            img_metas=img_metas,
+                            prev_bev=prev_bev
+                        )
+                else:
+                    bev_embed, bev_pos = self.pts_bbox_head.get_bev_features(
+                        mlvl_feats=img_feats,
+                        img_metas=img_metas,
+                        prev_bev=prev_bev
+                    )
+                
+                # bev_embed from get_bev_features: [B, H*W, C] where B=1
+                # We need [H*W, C] for storage
+                assert bev_embed.dim() == 3, f"BEV embed should be 3D, got shape: {bev_embed.shape}"
+                assert bev_embed.shape[0] == 1, f"Expected B=1, got shape: {bev_embed.shape}"
+                sample_bevs.append(bev_embed.squeeze(0))  # [1, H*W, C] -> [H*W, C]
+                
+                prev_bev = bev_embed
+            
+            # Stack all frames for this sample: [L, H*W, C]
+            sample_bevs = torch.stack(sample_bevs, dim=0)
+            all_bev_embeds.append(sample_bevs)
+        
+        # Stack all samples: [B, L, H*W, C]
+        all_bev_embeds = torch.stack(all_bev_embeds, dim=0)
+        
+        return all_bev_embeds, bev_pos
+
     # Generate bev using bev_encoder in BEVFormer
     def get_bevs(self, imgs, img_metas, prev_img=None, prev_img_metas=None, prev_bev=None,
                  img_feats=None, prev_img_feats=None):
@@ -553,6 +618,118 @@ class UniADTrack(MVXTwoStageDetector):
         out["track_instances"] = out_track_instances
         return out
 
+    @auto_fp16(apply_to=("bev_embed",))
+    def _forward_single_frame_with_bev(
+        self,
+        bev_embed,
+        bev_pos,
+        img_metas,
+        track_instances,
+        l2g_r1=None,
+        l2g_t1=None,
+        l2g_r2=None,
+        l2g_t2=None,
+        time_delta=None,
+        all_query_embeddings=None,
+        all_matched_indices=None,
+        all_instances_pred_logits=None,
+        all_instances_pred_boxes=None,
+    ):
+        """
+        Perform forward on one frame using pre-computed BEV features.
+        This avoids redundant BEV computation in the tracking loop.
+        
+        Args:
+            bev_embed: [H*W, 1, C] - pre-computed BEV features for this frame
+            bev_pos: [1, C, H, W] - BEV positional encoding
+            img_metas: List[Dict], len=1
+            track_instances: tracking instances
+            l2g_r1, l2g_t1: current frame's lidar2global transform
+            l2g_r2, l2g_t2: next frame's lidar2global transform (None if last frame)
+            time_delta: time difference to next frame
+        """
+        det_output = self.pts_bbox_head.get_detections(
+            bev_embed,
+            object_query_embeds=track_instances.query,
+            ref_points=track_instances.ref_pts,
+            img_metas=img_metas,
+        )
+
+        output_classes = det_output["all_cls_scores"]
+        output_coords = det_output["all_bbox_preds"]
+        output_past_trajs = det_output["all_past_traj_preds"]
+        last_ref_pts = det_output["last_ref_points"]
+        query_feats = det_output["query_feats"]
+
+        out = {
+            "pred_logits": output_classes[-1],
+            "pred_boxes": output_coords[-1],
+            "pred_past_trajs": output_past_trajs[-1],
+            "ref_pts": last_ref_pts,
+            "bev_embed": bev_embed,
+            "bev_pos": bev_pos
+        }
+        with torch.no_grad():
+            track_scores = output_classes[-1, 0, :].sigmoid().max(dim=-1).values
+
+        # Step-1 Update track instances with current prediction
+        nb_dec = output_classes.size(0)
+
+        track_instances_list = [
+            self._copy_tracks_for_loss(track_instances) for i in range(nb_dec - 1)
+        ]
+        track_instances.output_embedding = query_feats[-1][0]
+        velo = output_coords[-1, 0, :, -2:]
+        
+        if l2g_r2 is not None:
+            ref_pts = self.velo_update(
+                last_ref_pts[0],
+                velo,
+                l2g_r1,
+                l2g_t1,
+                l2g_r2,
+                l2g_t2,
+                time_delta=time_delta,
+            )
+        else:
+            ref_pts = last_ref_pts[0]
+
+        dim = track_instances.query.shape[-1]
+        track_instances.ref_pts = self.reference_points(track_instances.query[..., :dim//2])
+        track_instances.ref_pts[...,:2] = ref_pts[...,:2]
+
+        track_instances_list.append(track_instances)
+        
+        for i in range(nb_dec):
+            track_instances = track_instances_list[i]
+            track_instances.scores = track_scores
+            track_instances.pred_logits = output_classes[i, 0]
+            track_instances.pred_boxes = output_coords[i, 0]
+            track_instances.pred_past_trajs = output_past_trajs[i, 0]
+
+            out["track_instances"] = track_instances
+            track_instances, matched_indices = self.criterion.match_for_single_frame(
+                out, i, if_step=(i == (nb_dec - 1))
+            )
+            all_query_embeddings.append(query_feats[i][0])
+            all_matched_indices.append(matched_indices)
+            all_instances_pred_logits.append(output_classes[i, 0])
+            all_instances_pred_boxes.append(output_coords[i, 0])
+        
+        active_index = (track_instances.obj_idxes>=0) & (track_instances.iou >= self.gt_iou_threshold) & (track_instances.matched_gt_idxes >=0)
+        out.update(self.select_active_track_query(track_instances, active_index, img_metas))
+        out.update(self.select_sdc_track_query(track_instances[900], img_metas))
+        
+        if self.memory_bank is not None:
+            track_instances = self.memory_bank(track_instances)
+
+        tmp = {}
+        tmp["init_track_instances"] = self._generate_empty_tracks()
+        tmp["track_instances"] = track_instances
+        out_track_instances = self.query_interact(tmp)
+        out["track_instances"] = out_track_instances
+        return out
+
     def select_active_track_query(self, track_instances, active_index, img_metas, with_mask=True):
         result_dict = self._track_instances2results(track_instances[active_index], img_metas, with_mask=with_mask)
         result_dict["track_query_embeddings"] = track_instances.output_embedding[active_index][result_dict['bbox_index']][result_dict['mask']]
@@ -616,13 +793,22 @@ class UniADTrack(MVXTwoStageDetector):
                 sample_metas[i] = img_metas[flat_idx(b, i)]
             img_metas_per_sample.append(sample_metas)
         
-        # ============ True Batch Part: Feature Extraction ============
+        # ============ Phase 1: Batch-Parallel Feature Extraction ============
         # Extract features for all batches and all frames at once (fully parallel)
         # This is the key optimization - CNN/Transformer can process batch efficiently
         img_feats_all = self.extract_img_feat(img=img, len_queue=num_frame)
         # img_feats_all: List[Tensor[B, L, N, c, h, w]]
         
-        # ============ Loop Part: Tracking Processing ============
+        # ============ Phase 2: Batch-Parallel BEV Computation ============
+        # Pre-compute all BEV features with batch parallelism
+        # This eliminates redundant history BEV recomputation
+        all_bev_embeds, bev_pos = self.precompute_all_bevs(
+            img_feats_all, img_metas_per_sample, batch_size, num_frame
+        )
+        # all_bev_embeds: List[Tensor[H*W, B, C]], len=num_frame
+        # bev_pos: Tensor[B, C, H, W]
+        
+        # ============ Phase 3: Tracking Processing (per-sample loop) ============
         # Process each batch sample independently due to complex tracking state
         accumulated_losses = {}  # Accumulate losses across batch samples
         batch_outs = []
@@ -661,31 +847,18 @@ class UniADTrack(MVXTwoStageDetector):
             # Initialize criterion for this clip
             self.criterion.initialize_for_single_clip(gt_instances_list)
             
-            # Process each frame of this sample
+            # Process each frame of this sample using pre-computed BEV
             for i in range(num_frame):
                 fidx = flat_idx(b, i)
                 
-                # Extract features for this sample and frame (from pre-computed features)
-                img_feats_single = [feat[b:b+1, i] for feat in img_feats_all]
-                # Shape: [1, N, c, h, w]
+                # Get pre-computed BEV for this sample and frame
+                # all_bev_embeds shape: [B, L, H*W, C], extract [H*W, C] then unsqueeze to [H*W, 1, C]
+                bev_embed_single = all_bev_embeds[b, i].unsqueeze(1)  # [H*W, C] -> [H*W, 1, C]
+                bev_pos_single = bev_pos[0:1] if bev_pos is not None else None  # bev_pos is same for all
                 
-                # Prepare previous frames features for temporal context
-                if i > 0:
-                    prev_img_feats = [feat[b:b+1, :i] for feat in img_feats_all]
-                    # Shape: [1, i, N, c, h, w]
-                else:
-                    # First frame: use frame 0 as its own history (warm-up)
-                    prev_img_feats = [feat[b:b+1, :1] for feat in img_feats_all]
-                    # Shape: [1, 1, N, c, h, w]
-                
-                prev_img_metas = [img_metas_per_sample[b]]
-                
-                # Current frame
-                img_single = img[b:b+1, i, ...]  # [1, N, C, H, W]
                 img_metas_single = [copy.deepcopy(img_metas[fidx])]
                 
                 # Coordinate transforms (using flattened index)
-                # Ensure tensors are on the correct device
                 l2g_r1_cur = l2g_r_mat[fidx].to(img.device) if isinstance(l2g_r_mat[fidx], torch.Tensor) else torch.tensor(l2g_r_mat[fidx], device=img.device)
                 l2g_t1_cur = l2g_t[fidx].to(img.device) if isinstance(l2g_t[fidx], torch.Tensor) else torch.tensor(l2g_t[fidx], device=img.device)
                 
@@ -707,13 +880,12 @@ class UniADTrack(MVXTwoStageDetector):
                 all_instances_pred_logits = []
                 all_instances_pred_boxes = []
                 
-                # Forward single frame with pre-extracted features
-                frame_res = self._forward_single_frame_train(
-                    img_single,
+                # Forward single frame with pre-computed BEV (no redundant BEV computation)
+                frame_res = self._forward_single_frame_with_bev(
+                    bev_embed_single,
+                    bev_pos_single,
                     img_metas_single,
                     track_instances,
-                    None,  # prev_img not needed when using pre-extracted features
-                    prev_img_metas,
                     l2g_r1_cur,
                     l2g_t1_cur,
                     l2g_r2,
@@ -723,8 +895,6 @@ class UniADTrack(MVXTwoStageDetector):
                     all_matched_idxes,
                     all_instances_pred_logits,
                     all_instances_pred_boxes,
-                    img_feats=img_feats_single,
-                    prev_img_feats=prev_img_feats,
                 )
                 
                 # Update tracking instances
