@@ -808,6 +808,14 @@ class UniADTrack(MVXTwoStageDetector):
         # all_bev_embeds: List[Tensor[H*W, B, C]], len=num_frame
         # bev_pos: Tensor[B, C, H, W]
         
+        # ============ Phase 2.5: Pre-transfer coordinate transforms to GPU ============
+        # Batch transfer all l2g transforms to GPU at once to avoid repeated CPU-GPU sync in loop
+        # This reduces B*L*6 small transfers to just 3 batch transfers
+        # Note: l2g_r_mat, l2g_t, timestamp are List[Tensor] from dataloader (already converted by to_tensor)
+        l2g_r_all = torch.stack(l2g_r_mat).to(img.device, non_blocking=True)  # [B*L, 3, 3]
+        l2g_t_all = torch.stack(l2g_t).to(img.device, non_blocking=True)  # [B*L, 3] or [B*L, 1, 3]
+        ts_all = torch.stack(timestamp).to(img.device, non_blocking=True)  # [B*L] or [B*L, 1]
+        
         # ============ Phase 3: Tracking Processing (per-sample loop) ============
         # Process each batch sample independently due to complex tracking state
         accumulated_losses = {}  # Accumulate losses across batch samples
@@ -858,9 +866,9 @@ class UniADTrack(MVXTwoStageDetector):
                 
                 img_metas_single = [copy.deepcopy(img_metas[fidx])]
                 
-                # Coordinate transforms (using flattened index)
-                l2g_r1_cur = l2g_r_mat[fidx].to(img.device) if isinstance(l2g_r_mat[fidx], torch.Tensor) else torch.tensor(l2g_r_mat[fidx], device=img.device)
-                l2g_t1_cur = l2g_t[fidx].to(img.device) if isinstance(l2g_t[fidx], torch.Tensor) else torch.tensor(l2g_t[fidx], device=img.device)
+                # Coordinate transforms: directly index pre-transferred GPU tensors (no CPU-GPU sync)
+                l2g_r1_cur = l2g_r_all[fidx]
+                l2g_t1_cur = l2g_t_all[fidx]
                 
                 if i == num_frame - 1:
                     l2g_r2 = None
@@ -868,11 +876,9 @@ class UniADTrack(MVXTwoStageDetector):
                     time_delta = None
                 else:
                     next_fidx = flat_idx(b, i + 1)
-                    l2g_r2 = l2g_r_mat[next_fidx].to(img.device) if isinstance(l2g_r_mat[next_fidx], torch.Tensor) else torch.tensor(l2g_r_mat[next_fidx], device=img.device)
-                    l2g_t2 = l2g_t[next_fidx].to(img.device) if isinstance(l2g_t[next_fidx], torch.Tensor) else torch.tensor(l2g_t[next_fidx], device=img.device)
-                    ts_next = timestamp[next_fidx].to(img.device) if isinstance(timestamp[next_fidx], torch.Tensor) else torch.tensor(timestamp[next_fidx], device=img.device)
-                    ts_cur = timestamp[fidx].to(img.device) if isinstance(timestamp[fidx], torch.Tensor) else torch.tensor(timestamp[fidx], device=img.device)
-                    time_delta = ts_next - ts_cur
+                    l2g_r2 = l2g_r_all[next_fidx]
+                    l2g_t2 = l2g_t_all[next_fidx]
+                    time_delta = ts_all[next_fidx] - ts_all[fidx]
                 
                 # Storage for decoder outputs
                 all_query_embeddings = []

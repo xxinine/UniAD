@@ -49,8 +49,6 @@ def custom_train_detector(model,
                 f'{cfg.data.imgs_per_gpu} in this experiments')
         cfg.data.samples_per_gpu = cfg.data.imgs_per_gpu
 
-    print("DEBUG, before building data loaders")
-
     data_loaders = [
         build_dataloader(
             ds,
@@ -65,8 +63,6 @@ def custom_train_detector(model,
         ) for ds in dataset
     ]
 
-    print("DEBUG, before building data loaders")
-    
     # put model on gpus
     if distributed:
         find_unused_parameters = cfg.get('find_unused_parameters', False)
@@ -89,8 +85,6 @@ def custom_train_detector(model,
         if eval_model is not None:
             eval_model = MMDataParallel(
                 eval_model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
-
-    print("DEBUG, before building runner")
 
     # build runner
     optimizer = build_optimizer(model, cfg.optimizer)

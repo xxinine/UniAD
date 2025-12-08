@@ -6,10 +6,7 @@ from mmdet.core.bbox.assigners.assign_result import AssignResult
 from mmdet.core.bbox.transforms import bbox_cxcywh_to_xyxy
 from mmdet.core.bbox.match_costs import build_match_cost
 from mmdet.core.bbox.builder import BBOX_ASSIGNERS
-try:
-    from scipy.optimize import linear_sum_assignment
-except ImportError:
-    linear_sum_assignment = None
+from projects.mmdet3d_plugin.core.bbox.assigners.hungarian_gpu import linear_sum_assignment_gpu
 
 from mmdet.core.bbox.samplers.base_sampler import BaseSampler
 from mmdet.core.bbox.builder import BBOX_SAMPLERS
@@ -265,26 +262,16 @@ class HungarianAssigner_filter(BaseAssigner):
         
         cost = cls_cost + reg_cost + iou_cost 
         
-        # 3. do Hungarian matching on CPU using linear_sum_assignment
+        # 3. do Hungarian matching (GPU-accelerated if available)
         cost = cost.detach()
 
         assigned_gt_inds[:] = 0
         #index_set = []
         
-        if linear_sum_assignment is None:
-            raise ImportError('Please run "pip install scipy" '
-                              'to install scipy first.')
         result=None
         for i in range(min(self.max_pos, 300//num_gts)):
-            cost = cost.cpu()
-            matched_row_inds, matched_col_inds = linear_sum_assignment(cost)
+            matched_row_inds, matched_col_inds = linear_sum_assignment_gpu(cost)
             
-            matched_row_inds = torch.from_numpy(matched_row_inds).to(
-                bbox_pred.device)
-            matched_col_inds = torch.from_numpy(matched_col_inds).to(
-                bbox_pred.device)     
-            #print(matched_row_inds)
-            cost = cost.to(bbox_pred.device)
             cost[matched_row_inds,:] = INF   
             #index_set.(matched_row_inds)
             #print('this mathed row inds ', len(matched_row_inds), i)
@@ -426,16 +413,8 @@ class HungarianAssigner_multi_info(BaseAssigner):
         #
         cost = cls_cost + reg_cost + iou_cost + mask_cost
 
-        # 3. do Hungarian matching on CPU using linear_sum_assignment
-        cost = cost.detach().cpu()
-        if linear_sum_assignment is None:
-            raise ImportError('Please run "pip install scipy" '
-                              'to install scipy first.')
-        matched_row_inds, matched_col_inds = linear_sum_assignment(cost)
-        matched_row_inds = torch.from_numpy(matched_row_inds).to(
-            bbox_pred.device)
-        matched_col_inds = torch.from_numpy(matched_col_inds).to(
-            bbox_pred.device)
+        # 3. do Hungarian matching (GPU-accelerated if available)
+        matched_row_inds, matched_col_inds = linear_sum_assignment_gpu(cost.detach())
         # 4. assign backgrounds and foregrounds
         # assign all indices to backgrounds first
         assigned_gt_inds[:] = 0

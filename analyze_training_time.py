@@ -19,6 +19,7 @@ def parse_log_file(log_file):
         'iters': [],
         'times': [],
         'data_times': [],
+        'memories': [],
         'start_time': None,
         'workflow_start': None,
         'end_time': None,
@@ -30,6 +31,7 @@ def parse_log_file(log_file):
     epoch_pattern = r'Epoch \[(\d+)\]\[(\d+)/(\d+)\]'
     time_pattern = r'time: ([\d.]+)'
     data_time_pattern = r'data_time: ([\d.]+)'
+    memory_pattern = r'memory: (\d+)'
     timestamp_pattern = r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})'
     workflow_pattern = r'workflow: \[\(\'train\', 1\)\]'
     checkpoint_pattern = r'Saving checkpoint at (\d+) epochs'
@@ -90,6 +92,12 @@ def parse_log_file(log_file):
                     data_time = float(data_time_match.group(1))
                     epoch_data[epoch]['data_times'].append(data_time)
                 
+                # Extract memory (in MB)
+                memory_match = re.search(memory_pattern, line)
+                if memory_match:
+                    memory_mb = int(memory_match.group(1))
+                    epoch_data[epoch]['memories'].append(memory_mb)
+                
                 # Update end time for epoch (last iteration timestamp)
                 if ts_match:
                     epoch_data[epoch]['end_time'] = current_time
@@ -133,6 +141,7 @@ def analyze_epochs(epoch_data, total_start_time, total_end_time):
     
     all_iter_times = []
     all_data_times = []
+    all_memories = []
     epoch_durations = []
     
     for epoch in sorted(complete_epochs.keys()):
@@ -145,8 +154,17 @@ def analyze_epochs(epoch_data, total_start_time, total_end_time):
         avg_data_time = sum(data['data_times']) / len(data['data_times']) if data['data_times'] else 0
         compute_time = avg_time - avg_data_time
         
+        # Memory statistics
+        avg_memory_mb = sum(data['memories']) / len(data['memories']) if data['memories'] else 0
+        max_memory_mb = max(data['memories']) if data['memories'] else 0
+        min_memory_mb = min(data['memories']) if data['memories'] else 0
+        avg_memory_gb = avg_memory_mb / 1024
+        max_memory_gb = max_memory_mb / 1024
+        min_memory_gb = min_memory_mb / 1024
+        
         all_iter_times.extend(data['times'])
         all_data_times.extend(data['data_times'])
+        all_memories.extend(data['memories'])
         
         # Calculate actual epoch duration: workflow start → checkpoint save
         if data['start_time'] and data['checkpoint_time']:
@@ -164,6 +182,7 @@ def analyze_epochs(epoch_data, total_start_time, total_end_time):
         print(f"  Avg iter time: {avg_time:.4f} s/iter")
         print(f"  Avg data time: {avg_data_time:.4f} s/iter")
         print(f"  Compute time: {compute_time:.4f} s/iter")
+        print(f"  Memory usage: avg={avg_memory_gb:.2f} GB, max={max_memory_gb:.2f} GB, min={min_memory_gb:.2f} GB")
         print(f"  Epoch duration: {format_time(epoch_duration)}")
         
         if data['start_time']:
@@ -186,11 +205,18 @@ def analyze_epochs(epoch_data, total_start_time, total_end_time):
             avg_time = sum(data['times']) / len(data['times'])
             avg_data_time = sum(data['data_times']) / len(data['data_times']) if data['data_times'] else 0
             
+            # Memory statistics
+            avg_memory_mb = sum(data['memories']) / len(data['memories']) if data['memories'] else 0
+            max_memory_mb = max(data['memories']) if data['memories'] else 0
+            avg_memory_gb = avg_memory_mb / 1024
+            max_memory_gb = max_memory_mb / 1024
+            
             print(f"\nEpoch {epoch}:")
             print(f"  Status: ⚠ Incomplete")
             print(f"  Iterations logged: {len(data['times'])}/{data.get('total_iters', 'unknown')}")
             print(f"  Avg iter time: {avg_time:.4f} s/iter")
             print(f"  Avg data time: {avg_data_time:.4f} s/iter")
+            print(f"  Memory usage: avg={avg_memory_gb:.2f} GB, max={max_memory_gb:.2f} GB")
             
             if data['start_time']:
                 print(f"  Start: {data['start_time'].strftime('%Y-%m-%d %H:%M:%S')}")
@@ -227,6 +253,20 @@ def analyze_epochs(epoch_data, total_start_time, total_end_time):
         print(f"Overall avg iter time: {overall_avg_iter:.4f} s/iter")
         print(f"Overall avg data time: {overall_avg_data:.4f} s/iter")
         print(f"Compute time (iter - data): {overall_compute:.4f} s/iter")
+    
+    # Memory statistics
+    if all_memories:
+        overall_avg_memory_mb = sum(all_memories) / len(all_memories)
+        overall_max_memory_mb = max(all_memories)
+        overall_min_memory_mb = min(all_memories)
+        overall_avg_memory_gb = overall_avg_memory_mb / 1024
+        overall_max_memory_gb = overall_max_memory_mb / 1024
+        overall_min_memory_gb = overall_min_memory_mb / 1024
+        
+        print(f"\nMemory Usage (GPU):")
+        print(f"  Average: {overall_avg_memory_gb:.2f} GB")
+        print(f"  Maximum: {overall_max_memory_gb:.2f} GB")
+        print(f"  Minimum: {overall_min_memory_gb:.2f} GB")
     
     print("\n" + "="*80)
     

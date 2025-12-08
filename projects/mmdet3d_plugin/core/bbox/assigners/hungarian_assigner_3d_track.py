@@ -4,10 +4,7 @@ import torch
 from mmdet.core.bbox.builder import BBOX_ASSIGNERS
 from mmdet.core.bbox.assigners import BaseAssigner
 from mmdet.core.bbox.match_costs import build_match_cost
-try:
-    from scipy.optimize import linear_sum_assignment
-except ImportError:
-    linear_sum_assignment = None
+from .hungarian_gpu import linear_sum_assignment_gpu
 
 
 @BBOX_ASSIGNERS.register_module()
@@ -99,17 +96,9 @@ class HungarianAssigner3DTrack(BaseAssigner):
 
         cost = torch.nan_to_num(cost)
 
-        # 3. do Hungarian matching on CPU using linear_sum_assignment
-        cost = cost.detach().cpu()
-        if linear_sum_assignment is None:
-            raise ImportError('Please run "pip install scipy" '
-                              'to install scipy first.')
-        cost = np.nan_to_num(cost)
-        matched_row_inds, matched_col_inds = linear_sum_assignment(cost)
-        matched_row_inds = torch.from_numpy(matched_row_inds).to(
-            bbox_pred.device)
-        matched_col_inds = torch.from_numpy(matched_col_inds).to(
-            bbox_pred.device)
+        # 3. do Hungarian matching (GPU-accelerated if available)
+        cost = torch.nan_to_num(cost.detach())
+        matched_row_inds, matched_col_inds = linear_sum_assignment_gpu(cost)
 
         # 4. assign backgrounds and foregrounds
         # assign all indices to backgrounds first

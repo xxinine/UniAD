@@ -6,11 +6,7 @@ from mmdet.core.bbox.assigners import BaseAssigner
 from mmdet.core.bbox.match_costs import build_match_cost
 from mmdet.models.utils.transformer import inverse_sigmoid
 from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
-
-try:
-    from scipy.optimize import linear_sum_assignment
-except ImportError:
-    linear_sum_assignment = None
+from .hungarian_gpu import linear_sum_assignment_gpu, get_backend
 
 
 @BBOX_ASSIGNERS.register_module()
@@ -115,16 +111,9 @@ class HungarianAssigner3D(BaseAssigner):
         # weighted sum of above two costs
         cost = cls_cost + reg_cost
         
-        # 3. do Hungarian matching on CPU using linear_sum_assignment
-        cost = cost.detach().cpu()
-        if linear_sum_assignment is None:
-            raise ImportError('Please run "pip install scipy" '
-                              'to install scipy first.')
-        matched_row_inds, matched_col_inds = linear_sum_assignment(cost)
-        matched_row_inds = torch.from_numpy(matched_row_inds).to(
-            bbox_pred.device)
-        matched_col_inds = torch.from_numpy(matched_col_inds).to(
-            bbox_pred.device)
+        # 3. do Hungarian matching (GPU-accelerated if available)
+        # Keep cost on GPU if using cupy backend, otherwise will transfer to CPU
+        matched_row_inds, matched_col_inds = linear_sum_assignment_gpu(cost.detach())
 
         # 4. assign backgrounds and foregrounds
         # assign all indices to backgrounds first
