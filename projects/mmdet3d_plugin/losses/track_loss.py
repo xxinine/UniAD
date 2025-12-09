@@ -159,7 +159,7 @@ class ClipMatcher(nn.Module):
                                     device=self.sample_device)
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_boxes)
-        num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
+        num_boxes = torch.clamp(num_boxes / get_world_size(), min=1)  # 保持tensor，避免GPU同步
         return num_boxes
 
     @torch.no_grad()
@@ -280,7 +280,7 @@ class ClipMatcher(nn.Module):
             src_boxes[mask],
             target_boxes[mask],
             bbox_weights[mask],
-            avg_factor=avg_factor.item(),
+            avg_factor=avg_factor,  # 直接传递tensor，避免GPU同步
         )
         
         losses = {}
@@ -386,19 +386,20 @@ class ClipMatcher(nn.Module):
         }
         # step1. inherit and update the previous tracks.
         num_disappear_track = 0
-        for j in range(len(track_instances)):
-            obj_id = track_instances.obj_idxes[j].item()
+        # 批量处理：只同步1次而非N次，避免循环中的GPU同步开销
+        obj_idxes_cpu = track_instances.obj_idxes.cpu().numpy()
+        matched_gt_idxes = track_instances.matched_gt_idxes.clone()
+        for j, obj_id in enumerate(obj_idxes_cpu):
             # set new target idx.
             if obj_id >= 0:
                 if obj_id in obj_idx_to_gt_idx:
-                    track_instances.matched_gt_idxes[j] = obj_idx_to_gt_idx[
-                        obj_id]
+                    matched_gt_idxes[j] = obj_idx_to_gt_idx[obj_id]
                 else:
                     num_disappear_track += 1
-                    track_instances.matched_gt_idxes[
-                        j] = -1  # track-disappear case.
+                    matched_gt_idxes[j] = -1  # track-disappear case.
             else:
-                track_instances.matched_gt_idxes[j] = -1
+                matched_gt_idxes[j] = -1
+        track_instances.matched_gt_idxes = matched_gt_idxes
 
         full_track_idxes = torch.arange(
             len(track_instances), dtype=torch.long).to(pred_logits_i.device)
@@ -580,19 +581,20 @@ class ClipMatcher(nn.Module):
             }
 
             num_paired = 0
-            for j in range(len(track_instances)):
-                obj_id = track_instances.obj_idxes[j].item()
+            # 批量处理：只同步1次而非N次，避免循环中的GPU同步开销
+            obj_idxes_cpu = track_instances.obj_idxes.cpu().numpy()
+            matched_gt_idxes = track_instances.matched_gt_idxes.clone()
+            for j, obj_id in enumerate(obj_idxes_cpu):
                 # set new target idx.
                 if obj_id >= 0:
                     if obj_id in obj_idx_to_gt_idx:
-                        track_instances.matched_gt_idxes[
-                            j] = obj_idx_to_gt_idx[obj_id]
+                        matched_gt_idxes[j] = obj_idx_to_gt_idx[obj_id]
                         num_paired += 1
                     else:
-                        track_instances.matched_gt_idxes[
-                            j] = -1  # track-disappear case.
+                        matched_gt_idxes[j] = -1  # track-disappear case.
                 else:
-                    track_instances.matched_gt_idxes[j] = -1
+                    matched_gt_idxes[j] = -1
+            track_instances.matched_gt_idxes = matched_gt_idxes
 
             if num_paired > 0:
                 if_paired_i = track_instances.matched_gt_idxes >= 0

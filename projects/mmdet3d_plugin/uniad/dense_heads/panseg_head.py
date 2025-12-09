@@ -634,7 +634,7 @@ class PansegformerHead(SegDETRHead):
 
         num_total_pos_thing = loss_cls.new_tensor([num_total_pos_thing])
         num_total_pos_thing = torch.clamp(reduce_mean(num_total_pos_thing),
-                                          min=1).item()
+                                          min=1)  # 保持tensor，避免GPU同步
 
         # construct factors used for rescale bboxes
         factors = []
@@ -892,7 +892,7 @@ class PansegformerHead(SegDETRHead):
 
         num_total_pos_stuff = loss_cls.new_tensor([num_total_pos_stuff])
         num_total_pos_stuff = torch.clamp(reduce_mean(num_total_pos_stuff),
-                                          min=1).item()
+                                          min=1)  # 保持tensor，避免GPU同步
         if mask_preds_things.shape[0] == 0:
             loss_mask_things = (0 * mask_preds_things).sum()
         else:

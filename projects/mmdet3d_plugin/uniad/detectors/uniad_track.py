@@ -215,7 +215,7 @@ class UniADTrack(MVXTwoStageDetector):
 
     def _generate_empty_tracks(self):
         track_instances = Instances((1, 1))
-        num_queries, dim = self.query_embedding.weight.shape  # (300, 256 * 2)
+        num_queries, dim = self.query_embedding.weight.shape  # (901, 512) = (num_query+1, embed_dims*2)
         device = self.query_embedding.weight.device
         query = self.query_embedding.weight
         track_instances.ref_pts = self.reference_points(query[..., : dim // 2])
