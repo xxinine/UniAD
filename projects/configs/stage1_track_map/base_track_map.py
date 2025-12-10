@@ -484,6 +484,7 @@ data = dict(
     samples_per_gpu=2,
     workers_per_gpu=8,
     persistent_workers=True,
+    prefetch_factor=2,  # Each worker prefetches 2 batches (total: 8×2×2=32 samples)
     train=dict(
         type=dataset_type,
         file_client_args=file_client_args,

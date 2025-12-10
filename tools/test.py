@@ -195,6 +195,7 @@ def main():
         dist=distributed,
         shuffle=False,
         nonshuffler_sampler=cfg.data.nonshuffler_sampler,
+        prefetch_factor=cfg.data.get('prefetch_factor', 2),  # Default 2 if not in config
     )
 
     # build the model and load checkpoint

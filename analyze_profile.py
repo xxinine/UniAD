@@ -12,7 +12,7 @@ import os
 import glob
 
 # 自动查找最新的 trace 文件
-trace_pattern = "projects/work_dirs/stage1_track_map/base_track_map_profiler/profiler_logs/plugins/profile/*/*.pt.trace.json"
+trace_pattern = "projects/work_dirs/stage1_track_map/base_track_map_bf16_profiler/profiler_logs/plugins/profile/*/*.pt.trace.json"
 trace_files = glob.glob(trace_pattern)
 
 if not trace_files:
@@ -333,114 +333,6 @@ for category, kernels in sorted(kernel_categories.items(), key=lambda x: sum(t f
     for name, time, count in top3:
         short_name = name[:55] if len(name) > 55 else name
         print(f"  └─ {short_name:<55} {time:>10.2f} ms ({count:,} calls)")
-
-# ============= 6. 性能瓶颈与优化建议 =============
-print("\n" + "="*120)
-print("【6】性能瓶颈分析与优化建议")
-print("="*120)
-
-# 找出最大瓶颈
-top_cpu_op = sorted_cpu[0] if sorted_cpu else (None, {'total_time': 0, 'count': 0})
-top_gpu_kernel = sorted_gpu[0] if sorted_gpu else (None, {'total_time': 0, 'count': 0})
-top_cuda_api = sorted_cuda[0] if sorted_cuda else (None, {'total_time': 0, 'count': 0})
-
-print(f"""
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ TOP 性能热点                                                                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│ 1. CPU 最慢操作:                                                            │
-│    {top_cpu_op[0][:72] if top_cpu_op[0] else 'N/A':<72} │
-│    耗时: {top_cpu_op[1]['total_time']/1000:.2f} ms, 调用: {top_cpu_op[1]['count']:,} 次{' '*30}│
-│                                                                             │
-│ 2. GPU 最慢 Kernel:                                                         │
-│    {top_gpu_kernel[0][:72] if top_gpu_kernel[0] else 'N/A':<72} │
-│    耗时: {top_gpu_kernel[1]['total_time']/1000:.2f} ms, 调用: {top_gpu_kernel[1]['count']:,} 次{' '*30}│
-│                                                                             │
-│ 3. CUDA API 最大开销:                                                       │
-│    {top_cuda_api[0][:72] if top_cuda_api[0] else 'N/A':<72} │
-│    耗时: {top_cuda_api[1]['total_time']/1000:.2f} ms, 调用: {top_cuda_api[1]['count']:,} 次{' '*30}│
-└─────────────────────────────────────────────────────────────────────────────┘
-
-优化策略（按优先级排序）:
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🔥 高优先级 - 内存操作优化
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   当前: Memory Operations 占用 {stage_times['Memory Operations']/1000/num_iterations:.2f} ms/迭代
-   
-   建议:
-   • 检查模型中不必要的 .to() 和 .copy_() 调用
-   • 确保所有张量在训练开始前已在正确设备上
-   • 使用 inplace 操作（如 relu_、add_）减少内存分配
-   • 避免频繁的 CPU-GPU 数据传输
-   
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚡ 高优先级 - GPU 同步优化
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   当前: Synchronization 占用 {stage_times['Synchronization']/1000/num_iterations:.2f} ms/迭代
-   
-   建议:
-   • 使用 torch.cuda.stream() 创建多个 CUDA 流
-   • 避免在训练循环中使用 .item()、.cpu() 等同步操作
-   • 使用异步数据传输: to(device, non_blocking=True)
-   • 减少不必要的 torch.cuda.synchronize() 调用
-   
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 中优先级 - Deformable 操作优化
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   建议:
-   • Deformable Conv/Attn 是自定义 CUDA kernel
-   • 确保已使用 FP16/BF16 混合精度训练
-   • 考虑优化 CUDA kernel 实现（使用 TensorCore）
-   • 评估是否可以减少 deformable 层的数量
-   
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 中优先级 - 提升 GPU 利用率
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   当前: GPU 计算时间 {gpu_total_ms/1000/num_iterations:.2f}s, 墙上时间 {iter_time_s:.2f}s
-         GPU 利用率 ≈ {gpu_total_ms/1000/num_iterations/iter_time_s*100:.1f}%
-   
-   建议:
-   • 增大 batch size（如果显存允许）
-   • 使用梯度累积模拟更大 batch size
-   • 启用 torch.backends.cudnn.benchmark = True
-   • 检查是否有 CPU-bound 的数据增强操作
-   
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💡 低优先级 - 数据加载优化
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   建议:
-   • 增加 dataloader num_workers
-   • 启用 pin_memory=True
-   • 使用预取: prefetch_factor=2
-   • 考虑使用 DALI 等加速库
-""")
-
-print("\n" + "="*120)
-print("【性能目标】")
-print("="*120)
-
-# 计算优化潜力
-mem_ops_saving = stage_times['Memory Operations']/1000/num_iterations*0.5
-sync_saving = stage_times['Synchronization']/1000/num_iterations*0.5
-gpu_util_saving = max(0.3, iter_time_s * 0.15)  # 假设可提升15%
-total_potential = mem_ops_saving + sync_saving + gpu_util_saving
-target_time = max(iter_time_s - total_potential, iter_time_s * 0.7)  # 至少提升30%
-improvement_pct = (iter_time_s - target_time) / iter_time_s * 100
-
-print(f"""
-当前状态: {iter_time_s:.2f} 秒/迭代 (基于稳态性能，第 {profiler_wait + profiler_warmup + 1}-{profiler_wait + profiler_warmup + profiler_active} 次迭代)
-优化目标: {target_time:.2f} 秒/迭代 (提升 {improvement_pct:.1f}%)
-
-关键路径:
-  1. 减少内存操作开销: 节省约 {mem_ops_saving:.2f}s
-  2. 优化同步操作:     节省约 {sync_saving:.2f}s
-  3. 提升GPU利用率:    节省约 {gpu_util_saving:.2f}s
-  ────────────────────────────────────────
-  预期总提升:          {total_potential:.2f} 秒/迭代
-
-建议优先处理 TOP 10 CPU 操作和 TOP 10 GPU Kernel！
-""")
 
 print("="*120)
 print(f"✓ 分析完成！")

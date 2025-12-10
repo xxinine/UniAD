@@ -21,7 +21,7 @@ from mmcv.utils import _BatchNorm, TORCH_VERSION, digit_version
 
 @HOOKS.register_module()
 class Bf16OptimizerHook(OptimizerHook):
-    """BF16 Optimizer Hook for mixed precision training.
+    """BF16 Optimizer Hook for mixed precision training with gradient accumulation support.
     
     This hook wraps the model's forward method with BF16 autocast,
     while keeping parameters and gradients in FP32.
@@ -32,19 +32,26 @@ class Bf16OptimizerHook(OptimizerHook):
         coalesce (bool): Whether to coalesce gradient communication.
         bucket_size_mb (int): Bucket size for gradient coalescing.
         distributed (bool): Whether using distributed training.
+        cumulative_iters (int): Number of iterations to accumulate gradients before update.
+            Default: 1 (no accumulation). Set to >1 to simulate larger batch size.
     """
     
     def __init__(self,
                  grad_clip=None,
                  coalesce=True,
                  bucket_size_mb=-1,
-                 distributed=False):
+                 distributed=False,
+                 cumulative_iters=1):
         super(Bf16OptimizerHook, self).__init__(grad_clip)
         self.coalesce = coalesce
         self.bucket_size_mb = bucket_size_mb
         self.distributed = distributed
+        self.cumulative_iters = cumulative_iters
         self._original_forward = None
         self._patched_dcn = False
+        
+        # Gradient accumulation state
+        self._inner_iter = 0  # Current iteration within accumulation window
         
     def before_run(self, runner):
         """Initialize BF16 training by wrapping model forward.
@@ -55,6 +62,8 @@ class Bf16OptimizerHook(OptimizerHook):
         """
         runner.logger.info('='*50)
         runner.logger.info('Initializing BF16 Mixed Precision Training')
+        if self.cumulative_iters > 1:
+            runner.logger.info(f'✓ Gradient Accumulation enabled: {self.cumulative_iters} iterations')
         runner.logger.info('='*50)
         
         # Check BF16 support
@@ -182,40 +191,53 @@ class Bf16OptimizerHook(OptimizerHook):
         model.__class__.forward = wrapped_forward
     
     def after_train_iter(self, runner):
-        """Perform backward pass, gradient clipping and optimizer step.
+        """Perform backward pass with gradient accumulation support.
         
-        This method:
-        1. Backward pass to compute gradients
-        2. Reduces gradients across distributed processes
-        3. Clips gradients if configured
-        4. Updates optimizer
-        5. Zeros gradients
+        This method implements gradient accumulation:
+        1. Accumulate gradients over multiple iterations
+        2. Only update parameters every cumulative_iters iterations
+        3. Scale loss by 1/cumulative_iters to maintain effective learning rate
+        
+        Gradient accumulation flow:
+        - iter 1-3: backward() but no optimizer.step()
+        - iter 4: backward() + clip_grad + optimizer.step() + zero_grad()
         """
-        # Zero gradients before backward
-        runner.optimizer.zero_grad()
+        # Scale loss for gradient accumulation
+        # This ensures the effective gradient magnitude stays consistent
+        loss = runner.outputs['loss'] / self.cumulative_iters
         
-        # Backward pass to compute gradients
-        # Loss is already scaled appropriately by the model
-        runner.outputs['loss'].backward()
+        # Backward pass to compute gradients (accumulate)
+        loss.backward()
         
-        # All-reduce gradients in distributed training
-        if runner.world_size > 1:
-            allreduce_grads(
-                runner.model.parameters(),
-                self.coalesce,
-                self.bucket_size_mb
-            )
+        # Increment inner iteration counter
+        self._inner_iter += 1
         
-        # Gradient clipping
-        if self.grad_clip is not None:
-            grad_norm = self.clip_grads(runner.model.parameters())
-            if grad_norm is not None:
-                # Log gradient norm
-                runner.log_buffer.update({'grad_norm': float(grad_norm)},
-                                        runner.outputs['num_samples'])
-        
-        # Optimizer step (in FP32)
-        runner.optimizer.step()
+        # Only update parameters when accumulation window is complete
+        if self._inner_iter % self.cumulative_iters == 0:
+            # All-reduce gradients in distributed training
+            if runner.world_size > 1:
+                allreduce_grads(
+                    runner.model.parameters(),
+                    self.coalesce,
+                    self.bucket_size_mb
+                )
+            
+            # Gradient clipping (on accumulated gradients)
+            if self.grad_clip is not None:
+                grad_norm = self.clip_grads(runner.model.parameters())
+                if grad_norm is not None:
+                    # Log gradient norm
+                    runner.log_buffer.update({'grad_norm': float(grad_norm)},
+                                            runner.outputs['num_samples'])
+            
+            # Optimizer step (update parameters)
+            runner.optimizer.step()
+            
+            # Zero gradients for next accumulation window
+            runner.optimizer.zero_grad()
+            
+            # Reset inner iteration counter
+            self._inner_iter = 0
     
     def clip_grads(self, params):
         """Clip gradients.

@@ -60,6 +60,7 @@ def custom_train_detector(model,
             seed=cfg.seed,
             shuffler_sampler=cfg.data.shuffler_sampler,  # dict(type='DistributedGroupSampler'),
             nonshuffler_sampler=cfg.data.nonshuffler_sampler,  # dict(type='DistributedSampler'),
+            prefetch_factor=cfg.data.get('prefetch_factor', 2),  # Default 2 if not in config
         ) for ds in dataset
     ]
 
@@ -173,6 +174,7 @@ def custom_train_detector(model,
             shuffle=False,
             shuffler_sampler=cfg.data.shuffler_sampler,  # dict(type='DistributedGroupSampler'),
             nonshuffler_sampler=cfg.data.nonshuffler_sampler,  # dict(type='DistributedSampler'),
+            prefetch_factor=cfg.data.get('prefetch_factor', 2),  # Default 2 if not in config
         )
         eval_cfg = cfg.get('evaluation', {})
         eval_cfg['by_epoch'] = cfg.runner['type'] != 'IterBasedRunner'
