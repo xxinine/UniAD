@@ -65,6 +65,15 @@ sed -i '1s|#!/ssd2/wenshengzhao/anaconda3/envs/uniad_new/bin/python|#!/root/anac
 # ---- NCCL over TCP (no InfiniBand on A100 PCIe nodes) --------------------- #
 export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-eth0}
 export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}
+# The image ships an IB RDMA/SHARP net plugin that hangs cross-node all-reduce
+# on a socket-only network. Force NCCL's built-in socket transport.
+export NCCL_NET_PLUGIN=${NCCL_NET_PLUGIN:-none}
+export NCCL_COLLNET_ENABLE=${NCCL_COLLNET_ENABLE:-0}
+# The LL/LL128 protocols hang on this Azure socket network; Simple works.
+export NCCL_PROTO=${NCCL_PROTO:-Simple}
+# Intra-node CUMEM P2P (A100 80GB PCIe, no NVLink, under CUDA forward-compat)
+# intermittently deadlocks the collective; route intra-node via SHM instead.
+export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
 # Optional verbosity for the first bring-up; comment out for normal runs.
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 

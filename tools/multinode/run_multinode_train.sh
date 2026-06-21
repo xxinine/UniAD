@@ -96,7 +96,7 @@ nccl_incontainer_cmd() {
     # container always cleans up (avoids wedged containerd state).
     echo "source /root/anaconda3/etc/profile.d/conda.sh; conda activate uniad_new; \
 export LD_LIBRARY_PATH=/root/anaconda3/envs/uniad_new/lib/python3.8/site-packages/torch/lib:\$LD_LIBRARY_PATH; \
-export NCCL_SOCKET_IFNAME=eth0; export NCCL_IB_DISABLE=1; export NCCL_DEBUG=INFO; \
+export NCCL_SOCKET_IFNAME=eth0; export NCCL_IB_DISABLE=1; export NCCL_NET_PLUGIN=none; export NCCL_COLLNET_ENABLE=0; export NCCL_PROTO=Simple; export NCCL_P2P_DISABLE=1; export NCCL_DEBUG=INFO; \
 timeout 150 python -m torch.distributed.run --nproc_per_node=${GPUS_PER_NODE} --nnodes=${NNODES} --node_rank=${rank} \
 --master_addr=${MASTER_ADDR} --master_port=${MASTER_PORT} tools/multinode/nccl_test.py \
 2>&1 | tee /workspace/UniAD/tools/multinode/nccl_node${rank}.log"
