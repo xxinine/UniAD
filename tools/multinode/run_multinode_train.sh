@@ -89,14 +89,17 @@ cmd_run() {
 
 cmd_logs() { docker logs -f "${CONTAINER}"; }
 
-# Cross-node NCCL all-reduce sanity check (16 ranks) before real training.
+# Cross-node NCCL all-reduce sanity check before real training.
 nccl_incontainer_cmd() {
     local rank="$1"
+    # timeout makes the test self-terminate if NCCL hangs, so the --rm
+    # container always cleans up (avoids wedged containerd state).
     echo "source /root/anaconda3/etc/profile.d/conda.sh; conda activate uniad_new; \
 export LD_LIBRARY_PATH=/root/anaconda3/envs/uniad_new/lib/python3.8/site-packages/torch/lib:\$LD_LIBRARY_PATH; \
-export NCCL_SOCKET_IFNAME=eth0; export NCCL_IB_DISABLE=1; export NCCL_DEBUG=WARN; \
-torchrun --nproc_per_node=${GPUS_PER_NODE} --nnodes=${NNODES} --node_rank=${rank} \
---master_addr=${MASTER_ADDR} --master_port=${MASTER_PORT} tools/multinode/nccl_test.py"
+export NCCL_SOCKET_IFNAME=eth0; export NCCL_IB_DISABLE=1; export NCCL_DEBUG=INFO; \
+timeout 150 python -m torch.distributed.run --nproc_per_node=${GPUS_PER_NODE} --nnodes=${NNODES} --node_rank=${rank} \
+--master_addr=${MASTER_ADDR} --master_port=${MASTER_PORT} tools/multinode/nccl_test.py \
+2>&1 | tee /workspace/UniAD/tools/multinode/nccl_node${rank}.log"
 }
 
 launch_nccl_node() {
@@ -116,8 +119,8 @@ launch_nccl_node() {
 }
 
 cmd_nccltest() {
-    for rank in 1 2 3; do launch_nccl_node "${rank}" "-d"; done
-    echo "[rank0/master] running nccl test in foreground (16 ranks)..."
+    for rank in $(seq 1 $((NNODES-1))); do launch_nccl_node "${rank}" "-d"; done
+    echo "[rank0/master] running nccl test in foreground (${NNODES} nodes x ${GPUS_PER_NODE} GPUs)..."
     sleep 3
     launch_nccl_node 0 ""   # foreground, prints result
 }
