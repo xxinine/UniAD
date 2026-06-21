@@ -77,11 +77,11 @@ docker run ${flags} ${IMG} bash -lc '${TRAIN_SCRIPT} ${cfg}'"
 
 cmd_run() {
     local cfg="${1:?usage: run <CFG>}"
-    # Start workers (rank 1..3) first so they are waiting, then the master.
-    for rank in 1 2 3; do launch_node "${rank}" "${cfg}"; done
+    # Start workers (rank 1..NNODES-1) first so they are waiting, then the master.
+    for rank in $(seq 1 $((NNODES-1))); do launch_node "${rank}" "${cfg}"; done
     launch_node 0 "${cfg}"
     echo
-    echo "All 4 containers launched (16 GPUs). Following rank-0 log..."
+    echo "All ${NNODES} containers launched ($((NNODES*GPUS_PER_NODE)) GPUs). Following rank-0 log..."
     echo "Use '$0 logs' to re-attach, '$0 stop' to stop all."
     sleep 3
     docker logs -f "${CONTAINER}"

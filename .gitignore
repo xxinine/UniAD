@@ -11,6 +11,7 @@ __pycache__/
 *.avi
 ckpts/
 data
+data_local
 data_carla
 viz/
 .Python

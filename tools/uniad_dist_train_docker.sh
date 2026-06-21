@@ -18,19 +18,24 @@ WORK_DIR=$(echo ${CFG%.*} | sed -e "s/configs/work_dirs/g")/
 # Intermediate files and logs will be saved to UniAD/projects/work_dirs/
 
 # -------------------------------------------------- #
-# Create data symlink if not exists                  #
+# Ensure the dataset is available at ./data          #
+# When launched via tools/uniad_docker_run.sh the    #
+# repo (including ./data) is bind-mounted, so the     #
+# directory normally already exists.                 #
+# Otherwise a symlink to DATA_SOURCE is created.      #
+# DATA_SOURCE defaults to the shared Lustre dataset.  #
 # -------------------------------------------------- #
-DATA_SOURCE="/home/xueshu/work/data/nuscenes/data"
+DATA_SOURCE="${DATA_SOURCE:-/adlustre/nuscenes/data}"
 DATA_TARGET="$(dirname "$0")/../data"
 
-if [ ! -e ${DATA_TARGET} ]; then
+if [ -e ${DATA_TARGET} ]; then
+    echo "Using existing data directory: ${DATA_TARGET} -> $(readlink -f ${DATA_TARGET})"
+elif [ -n "${DATA_SOURCE}" ]; then
     echo "Creating symlink: ${DATA_TARGET} -> ${DATA_SOURCE}"
     ln -s ${DATA_SOURCE} ${DATA_TARGET}
-elif [ ! -L ${DATA_TARGET} ]; then
-    echo "Warning: ${DATA_TARGET} exists but is not a symlink"
-    echo "Please check your data directory setup"
 else
-    echo "Data symlink already exists: ${DATA_TARGET} -> $(readlink ${DATA_TARGET})"
+    echo "Error: ${DATA_TARGET} does not exist and DATA_SOURCE is not set"
+    exit 1
 fi
 
 if [ ! -d ${WORK_DIR}logs ]; then
